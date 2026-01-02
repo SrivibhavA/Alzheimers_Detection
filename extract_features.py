@@ -573,6 +573,17 @@ class AlzheimerClassifier:
         explainer = shap.KernelExplainer(lr_model.predict_proba, background)
         shap_values_raw = explainer.shap_values(X_scaled)
         
+        # DEBUG PRINTS
+        print(f"DEBUG: X shape: {X.shape}")
+        print(f"DEBUG: X_scaled shape: {X_scaled.shape}")
+        print(f"DEBUG: shap_values_raw type: {type(shap_values_raw)}")
+        if isinstance(shap_values_raw, list):
+            print(f"DEBUG: shap_values_raw list len: {len(shap_values_raw)}")
+            print(f"DEBUG: shap_values_raw[0] shape: {shap_values_raw[0].shape}")
+        else:
+            print(f"DEBUG: shap_values_raw shape: {shap_values_raw.shape}")
+            
+        # For Logistic Regression binary classification, SHAP returns list [prob_0, prob_1]
         if isinstance(shap_values_raw, list) and len(shap_values_raw) == 2:
 
             # List format (samples, features) per class
@@ -586,6 +597,9 @@ class AlzheimerClassifier:
             base_value = explainer.expected_value
             shap_values_raw = np.array(shap_values_raw)
         
+        print(f"DEBUG: Final shap_values_raw shape: {shap_values_raw.shape}")
+        print(f"DEBUG: Num features in self.features: {len(self.features)}")
+
         # Ensure base_value is a single scalar for np.repeat
         if hasattr(base_value, "__len__") and len(base_value) > 0:
             if isinstance(base_value, np.ndarray) and len(base_value.shape) > 0:
