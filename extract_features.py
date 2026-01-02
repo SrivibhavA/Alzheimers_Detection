@@ -2,13 +2,17 @@ import argparse
 import pandas as pd
 import mne
 import numpy as np
+import math
 import warnings
 import os
+import gc
 from datetime import datetime
 from scipy import signal
 from scipy.integrate import trapezoid
-import matplotlib.pyplot as plt
 import seaborn as sns
+import matplotlib
+matplotlib.use('Agg') # Prevent Tkinter main loop errors in scripts
+import matplotlib.pyplot as plt
 from sklearn.model_selection import StratifiedKFold, GridSearchCV, LeaveOneOut
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
@@ -18,7 +22,8 @@ from scipy.stats import mannwhitneyu
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
-from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix, classification_report
+from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix, classification_report, roc_curve, auc
+
 import shap
 import networkx as nx
 
@@ -98,11 +103,16 @@ class FeaturesExtracter:
         'Gamma': (30, 45)
     }
 
-    def compute_subject_spectral_features(self, subject_id, data_dir, test_mode=False):
+    # AD-Specific Regional Clusters (Posterior/Temporal)
+    # These regions are the first to show slowing and reduced reactivity in AD.
+    POSTERIOR_TEMPORAL = ['P3', 'P4', 'T5', 'T6', 'O1', 'O2']
+
+    def compute_subject_spectral_features(self, subject_id, data_dir, test_mode=False, cluster_only=True):
         """
-        Compute relative spectral power for all defined bands.
-        Returns a dictionary of features: { 'Rel_Power_Delta': val, ... }
+        Compute relative spectral power for the AD-critical Posterior/Temporal cluster.
+        If cluster_only is True, focuses only on the critical AD sensors.
         """
+
         try:
             raw = load_subject_eeg(subject_id, data_dir)
             
@@ -113,71 +123,129 @@ class FeaturesExtracter:
                 raw.crop(tmin=0, tmax=30)
             
             
+            # Explicitly pick EEG channels
             raw.pick(['eeg'], exclude='bads')
+            
+            # PREPROCESSING: CLEANING THE SIGNAL
+            # 1. Set Montage (essential for artifact rejection mapping)
+            try:
+                montage = mne.channels.make_standard_montage('standard_1020')
+                raw.set_montage(montage, on_missing='ignore', verbose=False)
+            except: pass
+
+            # 2. Common Average Reference (CAR) - Removes global noise
+            try:
+                raw.set_eeg_reference('average', projection=False, verbose=False)
+            except: pass
             
             # Broadband filter for spectral analysis
             raw.filter(0.5, 45, verbose=False)
             
             # Epochs
             epochs = mne.make_fixed_length_epochs(raw, duration=5.0, preload=True, verbose=False)
-            data = epochs.get_data() # (n_epochs, n_channels, n_times)
+            
+            # 3. ARTIFACT REJECTION (Crucial for Spectral Accuracy)
+            # Remove epochs with amplitude > 100uV (blinks/muscle)
+            try:
+                epochs.drop_bad(reject=dict(eeg=100e-6), verbose=False)
+            except: pass
+            
+            if len(epochs) == 0:
+                 return None
+
+            # Get channel names to identify regional sensors
+            ch_names = epochs.ch_names
+            
+            # Filter to cluster if requested
+            if cluster_only:
+                cluster_indices = [i for i, ch in enumerate(ch_names) if ch.upper() in self.POSTERIOR_TEMPORAL]
+                if not cluster_indices:
+                    # Fallback if specific electrodes are missing (rare in 10-20)
+                    print(f"    ! Warning: Cluster electrodes {self.POSTERIOR_TEMPORAL} not found in {subject_id}. Using all sensors.")
+                    filtered_data = epochs.get_data()
+                else:
+                    filtered_data = epochs.get_data(picks=cluster_indices)
+            else:
+                filtered_data = epochs.get_data()
+                
             sfreq = 500
          
             # Compute PSD using Welch's method
-            # nperseg = min(500, data.shape[2]) # 1 sec window
-            freqs, psd = signal.welch(data, fs=sfreq, nperseg=500, axis=-1)
+            freqs, psd = signal.welch(filtered_data, fs=sfreq, nperseg=500, axis=-1)
             # psd shape: (n_epochs, n_channels, n_freqs)
             
-            # Average PSD across epochs and channels -> Global PSD
-            # shape: (n_freqs,)
+            # Average PSD across epochs and channels -> Regional PSD
             avg_psd = np.mean(psd, axis=(0, 1))
-            
-            features = {}
-            total_power = 0
-            
-            # Calculate power for each band
-            for band, (fmin, fmax) in self.BANDS.items():
-                idx_band = np.logical_and(freqs >= fmin, freqs <= fmax)
-                power = trapezoid(avg_psd[idx_band], freqs[idx_band])
-                features[f'Abs_{band}'] = power
-                total_power += power
-            
-            # Calculate Relative Power
-            for band in self.BANDS:
-                features[f'Rel_{band}'] = features[f'Abs_{band}'] / total_power if total_power > 0 else 0
-            
-            # Calculate spectral band ratios
-            rel_theta = features.get('Rel_Theta', 0)
-            rel_beta = features.get('Rel_Beta', 0)
-            rel_alpha = features.get('Rel_Alpha', 0)
 
-            features['Theta_Beta_Ratio'] = rel_theta / rel_beta if rel_beta > 0 else 0
-            features['Alpha_Theta_Ratio'] = rel_alpha / rel_theta if rel_theta > 0 else 0
-            features['Theta_Alpha_Ratio'] = rel_theta / rel_alpha if rel_alpha > 0 else 0  # DAR (gold standard)
+            results = {}
+            total_psd = trapezoid(avg_psd, freqs)
             
-            return features
+            # 1. Delta-Alpha Ratio (DAR) - Main Biomarker of Slowing
+            delta_val = trapezoid(avg_psd[(freqs >= 1) & (freqs <= 4)], freqs[(freqs >= 1) & (freqs <= 4)])
+            theta_val = trapezoid(avg_psd[(freqs >= 4) & (freqs <= 8)], freqs[(freqs >= 4) & (freqs <= 8)])
+            alpha_val = trapezoid(avg_psd[(freqs >= 8) & (freqs <= 12)], freqs[(freqs >= 8) & (freqs <= 12)])
+            beta_val  = trapezoid(avg_psd[(freqs >= 12) & (freqs <= 30)], freqs[(freqs >= 12) & (freqs <= 30)])
             
+            if alpha_val > 0:
+                results['Theta_Alpha_Ratio'] = theta_val / alpha_val
+            if beta_val > 0:
+                results['Theta_Beta_Ratio'] = theta_val / beta_val
+            
+            # Low/High Alpha Sub-bands (More sensitive to early AD slowing)
+            low_alpha_val = trapezoid(avg_psd[(freqs >= 8) & (freqs <= 10)], freqs[(freqs >= 8) & (freqs <= 10)])
+            high_alpha_val = trapezoid(avg_psd[(freqs >= 10) & (freqs <= 12)], freqs[(freqs >= 10) & (freqs <= 12)])
+            
+            if total_psd > 0:
+                results['Rel_Alpha'] = alpha_val / total_psd
+                results['Rel_Theta'] = theta_val / total_psd
+                results['Rel_Low_Alpha'] = low_alpha_val / total_psd
+                results['Rel_High_Alpha'] = high_alpha_val / total_psd
+                
+            # Peak Alpha Frequency (PAF) - Gold standard slowing marker
+            alpha_mask = (freqs >= 8) & (freqs <= 12)
+            if np.any(alpha_mask) and np.max(avg_psd[alpha_mask]) > 0:
+                peak_idx = np.argmax(avg_psd[alpha_mask])
+                results['Peak_Alpha_Freq'] = freqs[alpha_mask][peak_idx]
+                
+            # Store absolute values for Reactivity calculation
+            results['Abs_Alpha'] = alpha_val
+            results['Abs_Theta'] = theta_val
+            
+            return results
+
+
         except Exception as e:
-            print(f"Error extracting spectral features for {subject_id}: {e}")
+            print(f"    ! Error computing spectral features: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
-    def compute_subject_pli(self, subject_id, data_dir, test_mode=False):
+    def compute_subject_pli(self, subject_id, data_dir, test_mode=False, cluster_only=True):
         """
-        Load data and calculate the global PLI for a single subject.
+        Compute Global Phase Lag Index (Functional Connectivity) in the Alpha band.
+        If cluster_only is True, focuses on Connectivity within the Posterior regions.
         """
+        raw = load_subject_eeg(subject_id, data_dir)
+        if raw is None: return None
+        
+        # Standardize Temporal Sampling
+        if raw.times[-1] > 40: raw.crop(tmin=10, tmax=40)
+        elif raw.times[-1] > 30: raw.crop(tmin=0, tmax=30)
+
+        raw.pick(['eeg'], exclude='bads')
+        
+        # Filter to cluster if requested
+        if cluster_only:
+            valid_cluster = [ch for ch in raw.ch_names if ch.upper() in self.POSTERIOR_TEMPORAL]
+            if len(valid_cluster) >= 2:
+                raw.pick(valid_cluster)
+            else:
+                print(f"    ! Warning: Cluster too small for PLI in {subject_id}. Using all.")
+
         try:
-            raw = load_subject_eeg(subject_id, data_dir)
-            
-            # Standardize Temporal Sampling: Use same 30s window (10-40s) for all features
-            if raw.times[-1] > 40:
-                raw.crop(tmin=10, tmax=40)
-            elif raw.times[-1] > 30:
-                raw.crop(tmin=0, tmax=30)
-            
-            
-            
-            # Explicitly pick EEG channels
-            raw.pick(['eeg'], exclude='bads')
+            # 1. Preprocessing
+            raw.filter(8, 12, verbose=False) # AD changes are most significant in Alpha PLI
+
             
             # Set standard montage for robustness
             try:
@@ -270,133 +338,11 @@ class FeaturesExtracter:
         se /= np.log2(len(psd_norm))
         return se
 
-    @staticmethod
-    def _higuchi_fd(x, kmax=100):
-        """Calculate Higuchi Fractal Dimension (Complexity)."""
-        L = []
-        x = np.array(x, dtype=float)
-        N = len(x)
-        for k in range(1, kmax + 1):
-            Lk = []
-            for m in range(k):
-                Lmk = 0
-                for i in range(1, int(np.floor((N - m) / k))):
-                    Lmk += abs(x[m + i * k] - x[m + (i - 1) * k])
-                Lmk = Lmk * (N - 1) / np.floor((N - m) / float(k)) / k
-                Lk.append(Lmk)
-            L.append(np.log(np.mean(Lk)))
-        
-        # Fit line to log(L) vs log(1/k) to find slope (dimension) using simple least squares
-        k_idxs = np.arange(1, kmax + 1)
-        # Handle division by zero/log issues gracefully
-        valid = k_idxs > 0
-        x_reg = np.log(1.0 / k_idxs[valid])
-        y_reg = L
-        
-        # Slope is the HFD
-        slope, _ = np.polyfit(x_reg, y_reg, 1)
-        return slope
-
-    @staticmethod
-    def _sample_entropy(x, m=2, r=0.2):
-        """Optimized Sample Entropy using vectorization and downsampling."""
-        # Standardize: Downsample to ~100Hz if signal is large (e.g. 500Hz -> 100Hz)
-        # This keeps the window size manageable (3000 points) while preserving EEG complexity
-        if len(x) > 5000:
-            x = x[::5] 
-            
-        N = len(x)
-        # Normalize for pattern matching stability
-        x = (x - np.mean(x)) / (np.std(x) + 1e-12)
-        
-        def _get_matches(m_val):
-            # Create template matrix: (N-m, m)
-            patterns = np.zeros((N - m_val, m_val))
-            for k in range(m_val):
-                patterns[:, k] = x[k : N - m_val + k]
-            
-            count = 0
-            # Vectorized comparison for each template against all subsequent templates
-            for i in range(len(patterns) - 1):
-                # Chebyshev distance: max absolute difference
-                dist = np.max(np.abs(patterns[i+1:] - patterns[i]), axis=1)
-                count += np.sum(dist < r)
-            return count
-
-        # A: matches of length m+1, B: matches of length m
-        A = _get_matches(m + 1)
-        B = _get_matches(m)
-        
-        if A == 0 or B == 0: return 0
-        return -np.log(A / B)
-
-    
-    def compute_peak_alpha_frequency(self, subject_id, data_dir, test_mode=False):
-        """Extract Peak Alpha Frequency (PAF) - Slowing biomarker."""
-        raw = load_subject_eeg(subject_id, data_dir)
-        if raw is None: return None
-        
-        # Standardize Temporal Sampling: Use same 30s window (10-40s) for all features
-        if raw.times[-1] > 40:
-            raw.crop(tmin=10, tmax=40)
-        elif raw.times[-1] > 30:
-            raw.crop(tmin=0, tmax=30)
-        
-        
-        try:
-            # Filter for Alpha band
-            raw.filter(8, 12, verbose=False)
-            
-            # Get data (average of all channels)
-            data = raw.get_data().mean(axis=0)
-            sfreq = int(raw.info['sfreq'])
-            
-            # Compute PSD
-            freqs, psd = signal.welch(data, sfreq, nperseg=sfreq*2)
-            
-            # Find peak in 8-12 Hz
-            alpha_mask = (freqs >= 8) & (freqs <= 12)
-            alpha_freqs = freqs[alpha_mask]
-            alpha_psd = psd[alpha_mask]
-            
-            if len(alpha_psd) > 0:
-                peak_idx = np.argmax(alpha_psd)
-                paf = alpha_freqs[peak_idx]
-                return {'Peak_Alpha_Freq': paf}
-            else:
-                return None
-                
-        except Exception as e:
-            print(f"    ! Error computing PAF: {e}")
-            return None
-    
     def compute_subject_complexity(self, subject_id, data_dir, test_mode=False):
-        """Extract Sample Entropy (SampEn) - Gold Standard Complexity."""
-        raw = load_subject_eeg(subject_id, data_dir)
-        if raw is None: return None
-            
-        # Standardize Temporal Sampling: Use same 30s window (10-40s)
-        if raw.times[-1] > 40:
-            raw.crop(tmin=10, tmax=40)
-        elif raw.times[-1] > 30:
-            raw.crop(tmin=0, tmax=30)
-        
-        try:
-            # Filter for wide band
-            raw.filter(1, 45, verbose=False)
-            
-            # Get data (average of all channels)
-            data = raw.get_data().mean(axis=0)
-            sfreq = int(raw.info['sfreq'])
-            
-            # Sample Entropy
-            sampen = self._sample_entropy(data, m=2, r=0.2)
-            
-            return {'Sample_Entropy': sampen}
-                
-        except Exception as e:
-            print(f"    ! Error computing SampEn: {e}")
-            return None
+        """Deprecated - Focusing on high-accuracy spectral/connectivity features."""
+        return None
+
+
 
 
 class AlzheimerClassifier:
@@ -407,33 +353,42 @@ class AlzheimerClassifier:
     def __init__(self, output_dir="model_results"):
         self.output_dir = output_dir
         
-        # Expert advice: Switch to simpler Logistic Regression for small n=65
-        lr = LogisticRegression(random_state=42, class_weight='balanced', max_iter=1000, penalty='l2')
+        # Random Forest: Non-linear, robust to noise, good with complex interactions
+        rf = RandomForestClassifier(random_state=42, class_weight='balanced')
         
-        # Create a pipeline: Imputation -> Scaling (Normalization) -> Classifier
-        # Normalization is critical for Logistic Regression L2 penalty
-        pipeline = Pipeline([
+        # Pipeline: Imputer -> Scaler (optional for RF but good practice) -> RF
+        # REMOVED GridSearchCV: Overkill for small N, causes instability. 
+        # Fixed RandomForest (Tuned for Sensitivity)
+        self.model = Pipeline([
             ('imputer', SimpleImputer(strategy='median')),
             ('scaler', StandardScaler()),
-            ('lr', lr)
+            ('rf', RandomForestClassifier(
+                n_estimators=200,       # More trees for stability
+                max_depth=7,            # Deeper trees to capture subtleties
+                min_samples_split=5,
+                random_state=42,
+                class_weight='balanced',
+                n_jobs=2 # Reduced to 2 to prevent system lag/high memory pressure
+            ))
         ])
+
+
+
+
         
-        # Simple parameter grid to prevent overfitting
-        param_grid = {
-            'lr__C': [0.1, 1, 10]
-        }
-        self.model = GridSearchCV(pipeline, param_grid, cv=3, scoring='roc_auc')
-        
-        # EXPERT FUSION: Utilizing both Eyes Closed (EC) and Eyes Open (EO) biomarkers
+        # REFINED FEATURE SET: Only Statistically Significant Biomarkers
+        # Removed: Reactivity_Posterior_Alpha_Block (p=0.93), EO_Posterior_PLI (p=0.23)
         self.features = [
-            'Age',
-            'EC_Global_PLI',
-            'EO_Global_PLI',
-            'EC_Theta_Alpha_Ratio',
-            'EO_Theta_Alpha_Ratio',
-            'EC_Sample_Entropy',
-            'EO_Sample_Entropy'
+            'EC_Posterior_Theta_Alpha_Ratio', # p < 0.0001 (***)
+            'EC_Posterior_Rel_Alpha',         # p < 0.0001 (***)
+            'EC_Posterior_Rel_High_Alpha',    # p < 0.001 (***)
+            'EC_Posterior_Peak_Alpha_Freq',   # p < 0.01 (**)
+            'EC_Posterior_PLI'                # p < 0.05 (*)
         ]
+
+
+
+
 
         
         
@@ -449,8 +404,18 @@ class AlzheimerClassifier:
         X = df_clean[self.features]
         y = df_clean['Target'].values
         
+        # NaN Check
+        nan_counts = X.isna().sum()
+        total_rows = len(X)
+        if nan_counts.sum() > 0:
+            print("\n    ! WARNING: Missing Data Detected:")
+            for col, count in nan_counts.items():
+                if count > 0:
+                    print(f"      - {col}: {count}/{total_rows} missing ({count/total_rows:.1%})")
+        
         print(f"Data Prepared: {len(X)} samples. (A: {sum(y==1)}, C: {sum(y==0)})")
         return X, y
+
 
     def train_with_cv(self, df, use_loocv=False):
         """Train using Cross Validation and print metrics"""
@@ -483,19 +448,25 @@ class AlzheimerClassifier:
         except: pass
 
         # 3. Cross-Validation
-        if use_loocv or len(X) < 20:
+        # 3. Cross-Validation: User requested 5-Fold for stability/AUC over LOOCV
+        if use_loocv:
             print("\nStarting Leave-One-Out Cross-Validation (LOOCV)...")
             cv = LeaveOneOut()
         else:
             print("\nStarting Stratified 5-Fold Cross-Validation...")
             cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
             
         accuracies, aucs, sensitivities, specificities = [], [], [], []
+        tprs = []
+        mean_fpr = np.linspace(0, 1, 100)
         fold = 1
         
         report_lines = ["Starting Cross-Validation Summary", "="*30]
         report_lines.extend(stats_report)
         report_lines.append(f"\nData Prepared: {len(X)} samples. (A: {sum(y==1)}, C: {sum(y==0)})")
+        
+        plt.figure(figsize=(10, 8))
         
         for train_index, test_index in cv.split(X, y):
             X_train, X_test = X.iloc[train_index], X.iloc[test_index]
@@ -508,9 +479,24 @@ class AlzheimerClassifier:
             try:
                 # Use predict_proba for Logistic Regression AUC
                 y_prob = self.model.predict_proba(X_test)[:, 1]
-                auc = roc_auc_score(y_test, y_prob) if len(np.unique(y_test)) > 1 else 0.5
+                
+                # ROC Curve Logic
+                if len(np.unique(y_test)) > 1:
+                    fpr, tpr, _ = roc_curve(y_test, y_prob)
+                    roc_auc = auc(fpr, tpr)
+                    aucs.append(roc_auc)
+                    
+                    # Interpolate TPR for mean curve
+                    interp_tpr = np.interp(mean_fpr, fpr, tpr)
+                    interp_tpr[0] = 0.0
+                    tprs.append(interp_tpr)
+                    
+                    plt.plot(fpr, tpr, lw=1, alpha=0.3, label=f'Fold {fold} (AUC = {roc_auc:.2f})')
+                    auc_val = roc_auc
+                else:
+                    auc_val = 0.5
             except:
-                auc = 0.5 
+                auc_val = 0.5 
             
             # Confusion matrix metrics (manual check for LOOCV)
             if len(y_test) == 1:
@@ -530,20 +516,58 @@ class AlzheimerClassifier:
             accuracies.append(acc)
             if not np.isnan(sens): sensitivities.append(sens)
             if not np.isnan(spec): specificities.append(spec)
-            if auc != 0.5 or len(y_test) > 1: aucs.append(auc)
             
             if not use_loocv and len(X) >= 20:
-                print(f"Fold {fold}: Acc={acc:.2f}, AUC={auc:.2f}")
+                print(f"Fold {fold}: Acc={acc:.2f}, AUC={auc_val:.2f}")
             fold += 1
             
+        # Finalize ROC Plot with Professional Aesthetics
+        plt.style.use('seaborn-v0_8-paper')
+        plt.figure(figsize=(8, 6))
+        plt.plot([0, 1], [0, 1], linestyle='--', lw=2, color='gray', label='Chance (0.50)', alpha=.8)
+        
+        if len(tprs) > 0:
+            mean_tpr = np.mean(tprs, axis=0)
+            mean_tpr[-1] = 1.0
+            mean_auc = auc(mean_fpr, mean_tpr)
+            std_auc = np.std(aucs) if len(aucs) > 1 else 0
+            
+            label = f'Mean ROC (AUC = {mean_auc:.2f} $\\pm$ {std_auc:.2f})'
+            plt.plot(mean_fpr, mean_tpr, color='#2c3e50', label=label, lw=3, alpha=.9)
+            
+            # Add range shading
+            std_tpr = np.std(tprs, axis=0)
+            tprs_upper = np.minimum(mean_tpr + std_tpr, 1)
+            tprs_lower = np.maximum(mean_tpr - std_tpr, 0)
+            plt.fill_between(mean_fpr, tprs_lower, tprs_upper, color='grey', alpha=.2, label=r'$\pm$ 1 std. dev.')
+
+        plt.xlim([-0.02, 1.02])
+        plt.ylim([-0.02, 1.02])
+        plt.xlabel('False Positive Rate (1 - Specificity)', fontsize=12)
+        plt.ylabel('True Positive Rate (Sensitivity)', fontsize=12)
+        plt.title(f'Diagnostic Performance: ROC Curve (N={len(X)})', fontsize=14, fontweight='bold')
+        plt.legend(loc="lower right", fancybox=True, shadow=True, fontsize=10)
+        plt.grid(True, alpha=0.3)
+
+        
+        if self.output_dir:
+            auc_path = os.path.join(self.output_dir, "ai_auc_performance.png")
+            plt.savefig(auc_path)
+            print(f"✓ AI Performance Graph (AUC) saved to {auc_path}")
+        plt.close()
+
+
+            
+        auc_note = "(Note: AUC limited in LOOCV)" if use_loocv else ""
         summary_lines = [
             "-" * 30,
             f"MEAN ACCURACY:    {np.mean(accuracies):.3f}",
-            f"MEAN AUC:         {np.mean(aucs) if aucs else 0.5:.3f} (Note: AUC limited in LOOCV)",
+            f"MEAN AUC:         {np.mean(aucs) if aucs else 0.5:.3f} {auc_note}",
             f"MEAN SENSITIVITY: {np.mean(sensitivities):.3f}",
             f"MEAN SPECIFICITY: {np.mean(specificities):.3f}",
             "-" * 30
         ]
+
         
         for line in summary_lines:
             print(line)
@@ -563,19 +587,23 @@ class AlzheimerClassifier:
         # Train on full dataset
         self.model.fit(X, y)
         
-        # Get the best estimator for SHAP
-        best_pipeline = self.model.best_estimator_
-        X_scaled = best_pipeline.named_steps['scaler'].transform(X)
-        lr_model = best_pipeline.named_steps['lr']
+        # Get the pipeline directly (No grid search anymore)
+        pipeline = self.model
         
-        # BACKGROUND: use predict_proba for SHAP with Logistic Regression
-        background = shap.kmeans(X_scaled, 5) 
-        explainer = shap.KernelExplainer(lr_model.predict_proba, background)
-        shap_values_raw = explainer.shap_values(X_scaled)
+        # Preprocess data (Imputation + Scaling) before passing to RF
+        # We use the pipeline steps *before* the final model step
+        preprocessor = Pipeline(pipeline.steps[:-1])
+        X_processed = preprocessor.transform(X)
+        
+        rf_model = pipeline.named_steps['rf']
+        
+        # TreeExplainer is much faster and accurate for Random Forests
+        explainer = shap.TreeExplainer(rf_model)
+        shap_values_raw = explainer.shap_values(X_processed)
         
         # DEBUG PRINTS
         print(f"DEBUG: X shape: {X.shape}")
-        print(f"DEBUG: X_scaled shape: {X_scaled.shape}")
+        print(f"DEBUG: X_processed shape: {X_processed.shape}") # Changed from X_scaled
         print(f"DEBUG: shap_values_raw type: {type(shap_values_raw)}")
         if isinstance(shap_values_raw, list):
             print(f"DEBUG: shap_values_raw list len: {len(shap_values_raw)}")
@@ -722,35 +750,55 @@ def main():
             'Age': row.get('Age', np.nan)
         }
         
-        # 1. Extract Eyes Closed (EC) Features
-        print(f"    -> Extracting Eyes Closed (EC) biomarkers...")
+        # 1. Extract Eyes Closed (EC) Regional Features
+        print(f"    -> Extracting Posterior EC biomarkers...")
         try:
-            ec_pli = extractor.compute_subject_pli(sub_id, data_dir_ec, test_mode=TEST_MODE)
-            if ec_pli: result_entry['EC_Global_PLI'] = ec_pli['Global_PLI']
+            ec_pli = extractor.compute_subject_pli(sub_id, data_dir_ec, test_mode=TEST_MODE, cluster_only=True)
+            if ec_pli: result_entry['EC_Posterior_PLI'] = ec_pli['Global_PLI']
             
-            ec_spectral = extractor.compute_subject_spectral_features(sub_id, data_dir_ec, test_mode=TEST_MODE)
-            if ec_spectral: result_entry['EC_Theta_Alpha_Ratio'] = ec_spectral['Theta_Alpha_Ratio']
-            
-            ec_complexity = extractor.compute_subject_complexity(sub_id, data_dir_ec, test_mode=TEST_MODE)
-            if ec_complexity: result_entry['EC_Sample_Entropy'] = ec_complexity['Sample_Entropy']
+            ec_spectral = extractor.compute_subject_spectral_features(sub_id, data_dir_ec, test_mode=TEST_MODE, cluster_only=True)
+            if ec_spectral: 
+                result_entry['EC_Posterior_Theta_Alpha_Ratio'] = ec_spectral.get('Theta_Alpha_Ratio')
+                result_entry['EC_Posterior_Theta_Beta_Ratio'] = ec_spectral.get('Theta_Beta_Ratio')
+                result_entry['EC_Posterior_Rel_Alpha'] = ec_spectral.get('Rel_Alpha')
+                result_entry['EC_Posterior_Rel_High_Alpha'] = ec_spectral.get('Rel_High_Alpha')
+                result_entry['EC_Posterior_Peak_Alpha_Freq'] = ec_spectral.get('Peak_Alpha_Freq')
+                # Store absolute power for ABR calc
+                result_entry['EC_Abs_Alpha'] = ec_spectral.get('Abs_Alpha', np.nan)
+
+
         except Exception as e:
             print(f"    ! Error extracting EC data for {sub_id}: {e}")
         
-        # 2. Extract Eyes Open (EO) Features
-        print(f"    -> Extracting Eyes Open (EO) biomarkers...")
+        # 2. Extract Eyes Open (EO) Regional Features
+        print(f"    -> Extracting Posterior EO biomarkers...")
         try:
-            eo_pli = extractor.compute_subject_pli(sub_id, data_dir_eo, test_mode=TEST_MODE)
-            if eo_pli: result_entry['EO_Global_PLI'] = eo_pli['Global_PLI']
+            eo_pli = extractor.compute_subject_pli(sub_id, data_dir_eo, test_mode=TEST_MODE, cluster_only=True)
+            if eo_pli: result_entry['EO_Posterior_PLI'] = eo_pli['Global_PLI']
             
-            eo_spectral = extractor.compute_subject_spectral_features(sub_id, data_dir_eo, test_mode=TEST_MODE)
-            if eo_spectral: result_entry['EO_Theta_Alpha_Ratio'] = eo_spectral['Theta_Alpha_Ratio']
-            
-            eo_complexity = extractor.compute_subject_complexity(sub_id, data_dir_eo, test_mode=TEST_MODE)
-            if eo_complexity: result_entry['EO_Sample_Entropy'] = eo_complexity['Sample_Entropy']
+            eo_spectral = extractor.compute_subject_spectral_features(sub_id, data_dir_eo, test_mode=TEST_MODE, cluster_only=True)
+            if eo_spectral: 
+                result_entry['EO_Posterior_Rel_Alpha'] = eo_spectral.get('Rel_Alpha', np.nan)
+                # Store absolute power for ABR calc
+                result_entry['EO_Abs_Alpha'] = eo_spectral.get('Abs_Alpha', np.nan)
+
         except Exception as e:
             print(f"    ! Note: EO data missing/failed for {sub_id}")
 
+        # 3. Calculate Regional "Reactivity" (ABR = EC / EO)
+        # Healthy brains block alpha in posterior regions when eyes open.
+        if result_entry.get('EC_Abs_Alpha') and result_entry.get('EO_Abs_Alpha'):
+            ec_alpha = result_entry['EC_Abs_Alpha']
+            eo_alpha = result_entry['EO_Abs_Alpha']
+            if eo_alpha > 0:
+                result_entry['Reactivity_Posterior_Alpha_Block'] = ec_alpha / eo_alpha
+
+
+
+
+
         # Check if we successfully extracted multi-condition data
+
         has_ec = any(k.startswith('EC_') for k in result_entry.keys())
         has_eo = any(k.startswith('EO_') for k in result_entry.keys())
         
@@ -759,6 +807,11 @@ def main():
             print(f"    >>> Status: EC Features={'✓' if has_ec else '✗'} | EO Features={'✓' if has_eo else '✗'}")
         else:
             print(f"    -> Failed to compute any resting-state biomarkers.")
+        
+        # Explicitly clear memory after each subject
+        del result_entry
+        gc.collect()
+
         
         print(f"    {'-'*40}")
 
@@ -769,6 +822,27 @@ def main():
         return
 
     df_results = pd.DataFrame(results)
+    
+    # Ensure all expected features exist (fill with NaN if missing)
+    expected_features = [
+            'EC_Posterior_Theta_Alpha_Ratio', 'EC_Posterior_Rel_Alpha',
+            'EC_Posterior_Rel_High_Alpha', 'EC_Posterior_Peak_Alpha_Freq',
+            'EC_Posterior_PLI'
+        ]
+
+
+
+
+
+
+
+
+
+
+    for col in expected_features:
+        if col not in df_results.columns:
+            df_results[col] = np.nan
+
     
     # ==========================================
     # AI MODEL TRAINING & DIAGNOSIS
@@ -783,9 +857,16 @@ def main():
     classifier = AlzheimerClassifier(output_dir=output_dir)
     
     # 2. Run Robust Cross-Validation 
-    # Use LOOCV for full analysis to maximize every sample
-    is_full_analysis = not TEST_MODE
-    mean_acc = classifier.train_with_cv(df_results, use_loocv=is_full_analysis)
+    # Logic: Use 5-Fold (User Preference) for Full Data, but LOOCV for Small Data (N < 35) to avoid math errors
+    if len(df_results) < 35:
+        print(f"\n[Auto-Switch] Dataset too small for 5-Fold (N={len(df_results)}). Switching to Leave-One-Out CV for stability.")
+        use_loocv_flag = True
+    else:
+        use_loocv_flag = False 
+ 
+        
+    mean_acc = classifier.train_with_cv(df_results, use_loocv=use_loocv_flag)
+
     
     # 3. Finalize folder name with accuracy (optional but helpful)
     final_output_dir = f"{output_dir}_Acc{int(mean_acc * 100)}"
@@ -802,14 +883,23 @@ def main():
     # 5. Save Plots
     try:
         features_to_plot = {
-            'EC_Global_PLI': 'Functional Connectivity (EC PLI)',
-            'EO_Global_PLI': 'Functional Connectivity (EO PLI)',
-            'EC_Theta_Alpha_Ratio': 'Theta/Alpha Ratio (EC DAR)',
-            'EO_Theta_Alpha_Ratio': 'Theta/Alpha Ratio (EO DAR)',
-            'EC_Sample_Entropy': 'Signal Complexity (EC SampEn)',
-            'EO_Sample_Entropy': 'Signal Complexity (EO SampEn)',
-            'Age': 'Patient Age'
+            'EC_Posterior_Theta_Alpha_Ratio': 'Posterior Slowing (EC)',
+            'EC_Posterior_Rel_Alpha': 'Posterior Alpha (EC)',
+            'EC_Posterior_Rel_High_Alpha': 'High Alpha (10-12 Hz)',
+            'EC_Posterior_Peak_Alpha_Freq': 'Peak Alpha Frequency (PAF)',
+            'EC_Posterior_PLI': 'Posterior Connectivity (EC)'
         }
+
+
+
+
+
+
+
+
+
+
+
 
         
         for feature, title in features_to_plot.items():
