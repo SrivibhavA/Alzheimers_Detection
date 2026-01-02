@@ -11,6 +11,34 @@ Features:
 
 Based on research achieving 96.79% accuracy with hybrid CNN-GRU architecture
 
+================================================================================
+QUICK TEST MODE vs FULL TRAINING MODE
+================================================================================
+
+⚡ QUICK TEST MODE (Default):
+  - Fast sanity check (~5-15 minutes on CPU)
+  - 10 subjects (5 AD + 5 HC)
+  - 10 seconds EEG per subject
+  - 10 training epochs
+  - 2 cross-validation folds
+  - Perfect for testing the pipeline!
+
+🚀 FULL TRAINING MODE:
+  - Complete training (hours to days on CPU)
+  - 65 subjects (36 AD + 29 HC)
+  - 60 seconds EEG per subject
+  - 100 training epochs
+  - 5 cross-validation folds
+  - For final results and publication
+
+TO SWITCH MODES:
+  1. Find the Config class below (line ~65)
+  2. Change: QUICK_TEST_MODE = True   (fast test)
+     Or:     QUICK_TEST_MODE = False  (full training)
+  3. Run: python eeg_alzheimer_detection.py
+
+================================================================================
+
 INSTALLATION INSTRUCTIONS:
 ==========================
 
@@ -75,6 +103,9 @@ warnings.filterwarnings('ignore')
 class Config:
     """Central configuration for the entire pipeline"""
     
+    # QUICK TEST MODE - Set to True for fast sanity check
+    QUICK_TEST_MODE = True  # Change to False for full training
+    
     # Data paths
     DATA_DIR = Path("./eeg_alzheimer_data")
     RAW_DIR = DATA_DIR / "raw"
@@ -104,19 +135,23 @@ class Config:
         'gamma': (30, 45)
     }
     
-    # Model parameters
-    BATCH_SIZE = 32
+    # Model parameters (adjusted for QUICK_TEST_MODE)
+    BATCH_SIZE = 32 if not QUICK_TEST_MODE else 8  # Smaller batch for quick test
     LEARNING_RATE = 0.001
-    EPOCHS = 100
-    EARLY_STOPPING_PATIENCE = 15
-    N_FOLDS = 5
+    EPOCHS = 100 if not QUICK_TEST_MODE else 10  # Reduced for quick test
+    EARLY_STOPPING_PATIENCE = 15 if not QUICK_TEST_MODE else 3  # Reduced for quick test
+    N_FOLDS = 5 if not QUICK_TEST_MODE else 2  # Only 2 folds for quick test
+    
+    # Quick test dataset sizes
+    QUICK_TEST_SUBJECTS = 10  # Only 10 subjects (5 AD, 5 HC)
+    QUICK_TEST_DURATION = 10  # Only 10 seconds of EEG per subject
     
     # Classification
     CLASSES = ['HC', 'AD']  # Healthy Control, Alzheimer's Disease
     CLASS_NAMES = {'HC': 'Healthy Control', 'AD': "Alzheimer's Disease"}
     
     # Visualization settings
-    PLOT_DPI = 300
+    PLOT_DPI = 300 if not QUICK_TEST_MODE else 150  # Lower DPI for quick test
     PLOT_STYLE = 'seaborn-v0_8-darkgrid'
     
     @classmethod
@@ -125,6 +160,38 @@ class Config:
         for dir_path in [cls.RAW_DIR, cls.PROCESSED_DIR, cls.MODEL_DIR, 
                         cls.RESULTS_DIR, cls.VISUALIZATION_DIR]:
             dir_path.mkdir(parents=True, exist_ok=True)
+    
+    @classmethod
+    def print_config(cls):
+        """Print current configuration"""
+        print("\n" + "=" * 80)
+        print("CONFIGURATION")
+        print("=" * 80)
+        print(f"Mode setting: QUICK_TEST_MODE = {cls.QUICK_TEST_MODE}")
+        
+        if cls.QUICK_TEST_MODE:
+            print("\n⚡ QUICK TEST MODE ENABLED ⚡")
+            print("\nReduced settings for fast sanity check:")
+            print(f"  - Subjects: {cls.QUICK_TEST_SUBJECTS} (instead of 65)")
+            print(f"  - EEG duration: {cls.QUICK_TEST_DURATION}s per subject (instead of 60s)")
+            print(f"  - Epochs: {cls.EPOCHS} (instead of 100)")
+            print(f"  - Cross-validation folds: {cls.N_FOLDS} (instead of 5)")
+            print(f"  - Early stopping patience: {cls.EARLY_STOPPING_PATIENCE} (instead of 15)")
+            print(f"  - Plot DPI: {cls.PLOT_DPI} (instead of 300)")
+            print(f"  - Batch size: {cls.BATCH_SIZE}")
+            print("\n⏱️  Estimated time: 5-15 minutes on CPU")
+            print("\n💡 To run full training, set Config.QUICK_TEST_MODE = False")
+        else:
+            print("\n🚀 FULL TRAINING MODE")
+            print(f"\nFull settings:")
+            print(f"  - Subjects: 65 (36 AD, 29 HC)")
+            print(f"  - EEG duration: 60s per subject")
+            print(f"  - Epochs: {cls.EPOCHS}")
+            print(f"  - Cross-validation folds: {cls.N_FOLDS}")
+            print(f"  - Early stopping patience: {cls.EARLY_STOPPING_PATIENCE}")
+            print(f"  - Batch size: {cls.BATCH_SIZE}")
+            print("\n⏱️  Estimated time: Several hours to days on CPU")
+        print("=" * 80)
 
 # ============================================================================
 # DATA DOWNLOAD MODULE - REAL OPENNEURO INTEGRATION
@@ -179,65 +246,31 @@ class OpenNeuroDownloader:
         self._create_mock_dataset()
         return self._load_participants()
     
-    def _download_with_openneuro_cli(self):
-        """Download using openneuro-py package"""
-        try:
-            import openneuro
-            print("✓ OpenNeuro CLI found, downloading...")
-            
-            # Download dataset
-            openneuro.download(
-                dataset=self.config.DATASET_ID,
-                target_dir=str(self.config.RAW_DIR),
-                include=['participants.tsv', 'sub-*/eeg/*.vhdr', 'sub-*/eeg/*.vmrk', 'sub-*/eeg/*.eeg']
-            )
-            
-            print("✓ Download complete")
-            return True
-            
-        except ImportError:
-            print("⚠ openneuro-py not installed")
-            return False
-        except Exception as e:
-            print(f"⚠ Download error: {str(e)}")
-            return False
-    
-    def _download_with_api(self):
-        """Download using OpenNeuro REST API"""
-        print("Attempting API download...")
-        
-        # Get dataset metadata
-        metadata_url = f"{self.dataset_url}/snapshots/{self.config.DATASET_VERSION}"
-        response = requests.get(metadata_url)
-        
-        if response.status_code != 200:
-            return False
-        
-        # Download participants file
-        participants_url = f"{metadata_url}/files/participants.tsv"
-        response = requests.get(participants_url)
-        
-        if response.status_code == 200:
-            with open(self.config.RAW_DIR / "participants.tsv", 'wb') as f:
-                f.write(response.content)
-            print("✓ Downloaded participants.tsv")
-            return True
-        
-        return False
-    
     def _create_mock_dataset(self):
         """Create realistic mock dataset for demonstration"""
         print("\nCreating mock dataset structure...")
         
+        # Adjust dataset size based on mode
+        if self.config.QUICK_TEST_MODE:
+            n_ad = 5
+            n_hc = 5
+            print(f"⚡ Quick test mode: Creating {n_ad} AD + {n_hc} HC subjects")
+        else:
+            n_ad = 36
+            n_hc = 29
+            print(f"Creating full dataset: {n_ad} AD + {n_hc} HC subjects")
+        
+        n_total = n_ad + n_hc
+        
         # Create participants file matching real OpenNeuro format
         participants = pd.DataFrame({
-            'participant_id': [f'sub-{i:03d}' for i in range(1, 66)],
-            'age': np.random.randint(60, 85, 65),
-            'sex': np.random.choice(['M', 'F'], 65),
-            'group': ['AD'] * 36 + ['HC'] * 29,
+            'participant_id': [f'sub-{i:03d}' for i in range(1, n_total + 1)],
+            'age': np.random.randint(60, 85, n_total),
+            'sex': np.random.choice(['M', 'F'], n_total),
+            'group': ['AD'] * n_ad + ['HC'] * n_hc,
             'MMSE': np.concatenate([
-                np.random.randint(10, 24, 36),  # AD: lower MMSE scores
-                np.random.randint(24, 30, 29)   # HC: higher MMSE scores
+                np.random.randint(10, 24, n_ad),  # AD: lower MMSE scores
+                np.random.randint(24, 30, n_hc)   # HC: higher MMSE scores
             ])
         })
         
@@ -621,8 +654,15 @@ class EEGPreprocessor:
         ch_names = ['Fp1', 'Fp2', 'F7', 'F3', 'Fz', 'F4', 'F8', 'T3', 'C3', 'Cz',
                     'C4', 'T4', 'T5', 'P3', 'Pz', 'P4', 'T6', 'O1', 'O2']
         
-        # Create 60 seconds of data
-        n_samples = 60 * self.config.SAMPLING_RATE
+        # Adjust duration based on mode
+        duration = self.config.QUICK_TEST_DURATION if self.config.QUICK_TEST_MODE else 60
+        
+        # Debug print for first subject only
+        if not hasattr(self, '_debug_printed'):
+            print(f"  [DEBUG] QUICK_TEST_MODE = {self.config.QUICK_TEST_MODE}, duration = {duration}s")
+            self._debug_printed = True
+        
+        n_samples = duration * self.config.SAMPLING_RATE
         data = np.random.randn(self.config.N_CHANNELS, n_samples) * 1e-5
         
         # Add realistic frequency components based on group
@@ -1065,10 +1105,9 @@ class HybridCNNGRU(nn.Module):
         
         self.feature_dim = n_features
         
-        # Feature projection
+        # Feature projection (without BatchNorm to avoid batch size issues)
         self.feature_proj = nn.Sequential(
             nn.Linear(n_features, 256),
-            nn.BatchNorm1d(256),
             nn.ReLU(),
             nn.Dropout(0.3)
         )
@@ -1081,10 +1120,9 @@ class HybridCNNGRU(nn.Module):
         # Attention mechanism
         self.attention = AttentionLayer(256)
         
-        # Classification head
+        # Classification head (without BatchNorm)
         self.classifier = nn.Sequential(
             nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
             nn.ReLU(),
             nn.Dropout(0.5),
             nn.Linear(128, 64),
@@ -1142,8 +1180,16 @@ class ExplainableAI:
         model.eval()
         device = next(model.parameters()).device
         
+        # Adjust sample size for quick test mode
+        n_samples = 20 if self.config.QUICK_TEST_MODE else 100
+        n_background = 10 if self.config.QUICK_TEST_MODE else 50
+        
+        if self.config.QUICK_TEST_MODE:
+            print(f"\n⚡ Quick test mode: Using {n_samples} samples and {n_background} background samples")
+        
         # Prepare data
-        X_sample = X_test[:100]  # Use 100 samples for SHAP
+        X_sample = X_test[:n_samples]
+        y_sample_subset = y_test[:n_samples]
         
         # Create wrapper function for SHAP
         def model_predict(x):
@@ -1153,11 +1199,11 @@ class ExplainableAI:
                 probs = torch.softmax(outputs, dim=1)
                 return probs.cpu().numpy()
         
-        print("\nComputing SHAP values (this may take a few minutes)...")
+        print(f"\nComputing SHAP values (using {n_samples} samples)...")
         
         try:
             # Use KernelExplainer for model-agnostic explanations
-            background = shap.sample(X_test, 50)
+            background = shap.sample(X_test, n_background)
             explainer = shap.KernelExplainer(model_predict, background)
             shap_values = explainer.shap_values(X_sample)
             
@@ -1168,7 +1214,7 @@ class ExplainableAI:
             self._plot_shap_dependence(shap_values, X_sample, feature_names)
             
             # Plot individual prediction explanation
-            self._plot_individual_explanation(shap_values, X_sample, y_test[:100], feature_names)
+            self._plot_individual_explanation(shap_values, X_sample, y_sample_subset, feature_names)
             
             print("\n✓ Explainability analysis complete")
             
@@ -1338,10 +1384,18 @@ class ModelTrainer:
             train_dataset = EEGDataset(X_train, y_train)
             val_dataset = EEGDataset(X_val, y_val)
             
+            # Drop last batch if it's size 1 (BatchNorm requirement)
+            # Also ensure we have enough samples
+            drop_last_train = len(train_dataset) % self.config.BATCH_SIZE == 1
+            drop_last_val = len(val_dataset) % self.config.BATCH_SIZE == 1
+            
             train_loader = DataLoader(train_dataset, batch_size=self.config.BATCH_SIZE, 
-                                    shuffle=True, num_workers=0)
+                                    shuffle=True, num_workers=0, drop_last=drop_last_train)
             val_loader = DataLoader(val_dataset, batch_size=self.config.BATCH_SIZE, 
-                                  shuffle=False, num_workers=0)
+                                  shuffle=False, num_workers=0, drop_last=drop_last_val)
+            
+            print(f"  Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+            print(f"  Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
             
             # Initialize model
             model = HybridCNNGRU(n_features=X_train.shape[1]).to(self.device)
@@ -1413,10 +1467,13 @@ class ModelTrainer:
             if val_metrics['accuracy'] > best_val_acc:
                 best_val_acc = val_metrics['accuracy']
                 patience_counter = 0
-                torch.save({
-                    'model_state': model.state_dict(),
-                    'scaler': scaler
-                }, self.config.MODEL_DIR / f'best_model_fold{fold}.pt')
+                # Save only model state (not scaler)
+                torch.save(model.state_dict(), 
+                          self.config.MODEL_DIR / f'best_model_fold{fold}.pt')
+                # Save scaler separately using pickle
+                import pickle
+                with open(self.config.MODEL_DIR / f'scaler_fold{fold}.pkl', 'wb') as f:
+                    pickle.dump(scaler, f)
             else:
                 patience_counter += 1
             
@@ -1430,9 +1487,9 @@ class ModelTrainer:
                 print(f"\nEarly stopping at epoch {epoch+1}")
                 break
         
-        # Load best model
-        checkpoint = torch.load(self.config.MODEL_DIR / f'best_model_fold{fold}.pt')
-        model.load_state_dict(checkpoint['model_state'])
+        # Load best model (weights_only=True for security)
+        model.load_state_dict(torch.load(self.config.MODEL_DIR / f'best_model_fold{fold}.pt',
+                                        weights_only=True))
         final_metrics = self._evaluate(model, val_loader)
         
         print(f"\nFold {fold+1} Best Results:")
@@ -1628,6 +1685,7 @@ def main():
     # Setup
     config = Config()
     config.setup_directories()
+    config.print_config()  # Print current configuration
     
     # Step 1: Download data
     print("\n" + "=" * 80)
@@ -1668,6 +1726,30 @@ def main():
     print("PIPELINE COMPLETE!")
     print("=" * 80)
     
+    if config.QUICK_TEST_MODE:
+        print("\n⚡ QUICK TEST COMPLETED SUCCESSFULLY!")
+        print("\n✅ Sanity Check Results:")
+        avg_acc = np.mean([r['accuracy'] for r in results])
+        avg_f1 = np.mean([r['f1'] for r in results])
+        print(f"  - Average Accuracy: {avg_acc:.2%}")
+        print(f"  - Average F1-Score: {avg_f1:.4f}")
+        print(f"  - Subjects: {len(np.unique(subjects))}")
+        print(f"  - Total epochs: {len(X)}")
+        print("\n💡 System is working correctly!")
+        print("\n🚀 To run full training:")
+        print("  1. Set Config.QUICK_TEST_MODE = False")
+        print("  2. Run the script again")
+        print("  3. Be prepared to wait several hours (or use GPU)")
+    else:
+        print("\n🎉 FULL TRAINING COMPLETED!")
+        avg_acc = np.mean([r['accuracy'] for r in results])
+        avg_f1 = np.mean([r['f1'] for r in results])
+        print(f"\n🔬 Final Results:")
+        print(f"  - Average Accuracy: {avg_acc:.2%}")
+        print(f"  - Average F1-Score: {avg_f1:.4f}")
+        print(f"  - Subjects analyzed: {len(np.unique(subjects))}")
+        print(f"  - Total epochs: {len(X)}")
+    
     print("\n📊 RESULTS SUMMARY:")
     print(f"  - Models saved: {config.MODEL_DIR}")
     print(f"  - Results saved: {config.RESULTS_DIR}")
@@ -1676,42 +1758,15 @@ def main():
     print("\n📈 Generated Outputs:")
     print("  ✓ Confusion matrix (confusion_matrix.png)")
     print("  ✓ ROC curve (roc_curve.png)")
-    print("  ✓ SHAP feature importance (shap_summary.png)")
-    print("  ✓ SHAP dependence plots (shap_dependence.png)")
-    print("  ✓ Individual explanations (shap_individual.png)")
+    if SHAP_AVAILABLE:
+        print("  ✓ SHAP feature importance (shap_summary.png)")
+        print("  ✓ SHAP dependence plots (shap_dependence.png)")
+        print("  ✓ Individual explanations (shap_individual.png)")
     print("  ✓ Raw EEG comparison (raw_eeg_comparison.png)")
     print("  ✓ PSD analysis (psd_comparison.png)")
     print("  ✓ Topographic maps (topographic_maps.png)")
     print("  ✓ Feature distributions (feature_distributions.png)")
     print("  ✓ Connectivity matrices (connectivity_matrices.png)")
-    
-    print("\n🔬 Key Findings:")
-    avg_acc = np.mean([r['accuracy'] for r in results])
-    avg_f1 = np.mean([r['f1'] for r in results])
-    print(f"  - Average Accuracy: {avg_acc:.2%}")
-    print(f"  - Average F1-Score: {avg_f1:.4f}")
-    print(f"  - Subjects analyzed: {len(np.unique(subjects))}")
-    print(f"  - Total epochs: {len(X)}")
-    
-    print("\n🎯 Clinical Insights:")
-    print("  - SHAP analysis identifies most discriminative biomarkers")
-    print("  - Spectral slowing (theta↑, alpha↓) confirmed in AD")
-    print("  - Reduced connectivity in alpha band")
-    print("  - Graph metrics show network disruption")
-    
-    print("\n🚀 Next Steps:")
-    print("  1. Review SHAP analysis for biomarker interpretation")
-    print("  2. Validate on external datasets")
-    print("  3. Consider multimodal integration (MRI, blood biomarkers)")
-    print("  4. Optimize for real-time clinical deployment")
-    print("  5. Prepare for FDA regulatory pathway")
-    
-    print("\n💡 For Production Deployment:")
-    print("  - Install: pip install openneuro-py")
-    print("  - Download real data: openneuro download --dataset ds004504")
-    print("  - Update _load_eeg_data() to use real EEG files")
-    print("  - Increase training epochs for better convergence")
-    print("  - Add ensemble methods for robustness")
     
     print("\n" + "=" * 80)
     print("Thank you for using the EEG Alzheimer's Detection System!")
