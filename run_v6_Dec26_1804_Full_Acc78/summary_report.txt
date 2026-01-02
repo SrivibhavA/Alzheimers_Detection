@@ -1,0 +1,19 @@
+Starting Cross-Validation Summary
+==============================
+Feature Significance (Mann-Whitney U):
+----------------------------------------
+Age                | p=0.3830 (ns)
+EC_Global_PLI      | p=0.1060 (ns)
+EO_Global_PLI      | p=0.0696 (ns)
+EC_Theta_Alpha_Ratio | p=0.0001 (***)
+EO_Theta_Alpha_Ratio | p=0.0002 (***)
+EC_Sample_Entropy  | p=0.8586 (ns)
+EO_Sample_Entropy  | p=0.4802 (ns)
+
+Data Prepared: 65 samples. (A: 36, C: 29)
+------------------------------
+MEAN ACCURACY:    0.785
+MEAN AUC:         0.500 (Note: AUC limited in LOOCV)
+MEAN SENSITIVITY: 0.778
+MEAN SPECIFICITY: 0.793
+------------------------------
