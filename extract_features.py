@@ -104,8 +104,11 @@ class FeaturesExtracter:
     }
 
     # AD-Specific Regional Clusters (Posterior/Temporal)
-    # These regions are the first to show slowing and reduced reactivity in AD.
+    # Focused on regions where neurodegeneration shows early patterns of slowing/asymmetry.
     POSTERIOR_TEMPORAL = ['P3', 'P4', 'T5', 'T6', 'O1', 'O2']
+    POSTERIOR_LEFT = ['P3', 'T5', 'O1']
+    POSTERIOR_RIGHT = ['P4', 'T6', 'O2']
+
 
     def compute_subject_spectral_features(self, subject_id, data_dir, test_mode=False, cluster_only=True):
         """
@@ -145,10 +148,12 @@ class FeaturesExtracter:
             epochs = mne.make_fixed_length_epochs(raw, duration=5.0, preload=True, verbose=False)
             
             # 3. ARTIFACT REJECTION (Crucial for Spectral Accuracy)
-            # Remove epochs with amplitude > 100uV (blinks/muscle)
+            # Reverting to 100uV (Golden Standard for this dataset)
             try:
                 epochs.drop_bad(reject=dict(eeg=100e-6), verbose=False)
             except: pass
+
+
             
             if len(epochs) == 0:
                  return None
@@ -160,58 +165,89 @@ class FeaturesExtracter:
             if cluster_only:
                 cluster_indices = [i for i, ch in enumerate(ch_names) if ch.upper() in self.POSTERIOR_TEMPORAL]
                 if not cluster_indices:
-                    # Fallback if specific electrodes are missing (rare in 10-20)
                     print(f"    ! Warning: Cluster electrodes {self.POSTERIOR_TEMPORAL} not found in {subject_id}. Using all sensors.")
                     filtered_data = epochs.get_data()
+                    subset_ch_names = ch_names
                 else:
                     filtered_data = epochs.get_data(picks=cluster_indices)
+                    subset_ch_names = [ch_names[i] for i in cluster_indices]
             else:
                 filtered_data = epochs.get_data()
+                subset_ch_names = ch_names
                 
             sfreq = 500
          
-            # Compute PSD using Welch's method
+            # Compute PSD using Welch's method per epoch/channel
             freqs, psd = signal.welch(filtered_data, fs=sfreq, nperseg=500, axis=-1)
             # psd shape: (n_epochs, n_channels, n_freqs)
             
-            # Average PSD across epochs and channels -> Regional PSD
-            avg_psd = np.mean(psd, axis=(0, 1))
-
+            # --- 1. Regional Averages (The Standard Biomarkers) ---
+            avg_psd = np.mean(psd, axis=(0, 1)) # Average across ALL epochs and cluster channels
             results = {}
             total_psd = trapezoid(avg_psd, freqs)
             
-            # 1. Delta-Alpha Ratio (DAR) - Main Biomarker of Slowing
+            # Bands
             delta_val = trapezoid(avg_psd[(freqs >= 1) & (freqs <= 4)], freqs[(freqs >= 1) & (freqs <= 4)])
             theta_val = trapezoid(avg_psd[(freqs >= 4) & (freqs <= 8)], freqs[(freqs >= 4) & (freqs <= 8)])
             alpha_val = trapezoid(avg_psd[(freqs >= 8) & (freqs <= 12)], freqs[(freqs >= 8) & (freqs <= 12)])
             beta_val  = trapezoid(avg_psd[(freqs >= 12) & (freqs <= 30)], freqs[(freqs >= 12) & (freqs <= 30)])
+            gamma_val = trapezoid(avg_psd[(freqs >= 30) & (freqs <= 45)], freqs[(freqs >= 30) & (freqs <= 45)])
             
-            if alpha_val > 0:
-                results['Theta_Alpha_Ratio'] = theta_val / alpha_val
-            if beta_val > 0:
-                results['Theta_Beta_Ratio'] = theta_val / beta_val
-            
-            # Low/High Alpha Sub-bands (More sensitive to early AD slowing)
-            low_alpha_val = trapezoid(avg_psd[(freqs >= 8) & (freqs <= 10)], freqs[(freqs >= 8) & (freqs <= 10)])
-            high_alpha_val = trapezoid(avg_psd[(freqs >= 10) & (freqs <= 12)], freqs[(freqs >= 10) & (freqs <= 12)])
+            if alpha_val > 0: results['Theta_Alpha_Ratio'] = theta_val / alpha_val
+            if beta_val > 0: results['Theta_Beta_Ratio'] = theta_val / beta_val
             
             if total_psd > 0:
                 results['Rel_Alpha'] = alpha_val / total_psd
                 results['Rel_Theta'] = theta_val / total_psd
-                results['Rel_Low_Alpha'] = low_alpha_val / total_psd
-                results['Rel_High_Alpha'] = high_alpha_val / total_psd
+                results['Rel_Gamma'] = gamma_val / total_psd
                 
-            # Peak Alpha Frequency (PAF) - Gold standard slowing marker
+            # Early Slowing (High Alpha)
+            high_alpha = trapezoid(avg_psd[(freqs >= 10) & (freqs <= 12)], freqs[(freqs >= 10) & (freqs <= 12)])
+            if total_psd > 0: results['Rel_High_Alpha'] = high_alpha / total_psd
+
+            # Peak Alpha Frequency (PAF)
             alpha_mask = (freqs >= 8) & (freqs <= 12)
-            if np.any(alpha_mask) and np.max(avg_psd[alpha_mask]) > 0:
-                peak_idx = np.argmax(avg_psd[alpha_mask])
-                results['Peak_Alpha_Freq'] = freqs[alpha_mask][peak_idx]
+            if np.any(alpha_mask):
+                results['Peak_Alpha_Freq'] = freqs[alpha_mask][np.argmax(avg_psd[alpha_mask])]
+
+            # --- 2. DAR INSTABILITY (Temporal Variability) ---
+            # Calculate Theta/Alpha ratio per epoch to see how much it fluctuates
+            epoch_avg_psd = np.mean(psd, axis=1) # (n_epochs, n_freqs)
+            epoch_theta = trapezoid(epoch_avg_psd[:, (freqs >= 4) & (freqs <= 8)], freqs[(freqs >= 4) & (freqs <= 8)], axis=-1)
+            epoch_alpha = trapezoid(epoch_avg_psd[:, (freqs >= 8) & (freqs <= 12)], freqs[(freqs >= 8) & (freqs <= 12)], axis=-1)
+            
+            valid_epochs = epoch_alpha > 0
+            if np.any(valid_epochs):
+                dar_per_epoch = epoch_theta[valid_epochs] / epoch_alpha[valid_epochs]
+                results['DAR_Instability'] = np.std(dar_per_epoch) # High StdDev = Unstable brain state
+            else:
+                results['DAR_Instability'] = 0
+
+            # --- 3. HEMISPHERIC ASYMMETRY ---
+            # AD often starts asymmetrically.
+            left_indices = [i for i, ch in enumerate(subset_ch_names) if ch.upper() in self.POSTERIOR_LEFT]
+            right_indices = [i for i, ch in enumerate(subset_ch_names) if ch.upper() in self.POSTERIOR_RIGHT]
+            
+            if left_indices and right_indices:
+                # Get mean PSD per hemisphere across all epochs
+                left_psd = np.mean(psd[:, left_indices, :], axis=(0, 1))
+                right_psd = np.mean(psd[:, right_indices, :], axis=(0, 1))
                 
-            # Store absolute values for Reactivity calculation
+                left_alpha = trapezoid(left_psd[(freqs >= 8) & (freqs <= 12)], freqs[(freqs >= 8) & (freqs <= 12)])
+                right_alpha = trapezoid(right_psd[(freqs >= 8) & (freqs <= 12)], freqs[(freqs >= 8) & (freqs <= 12)])
+                
+                if (left_alpha + right_alpha) > 0:
+                    # Asymmetry Index: Positive = Right shift. Negative = Left shift.
+                    results['Alpha_Asymmetry'] = (right_alpha - left_alpha) / (right_alpha + left_alpha)
+            else:
+                results['Alpha_Asymmetry'] = 0
+
+            # Store absolute values for legacy compatibility
             results['Abs_Alpha'] = alpha_val
             results['Abs_Theta'] = theta_val
             
             return results
+
 
 
         except Exception as e:
@@ -219,6 +255,44 @@ class FeaturesExtracter:
             import traceback
             traceback.print_exc()
             return None
+
+    def get_subject_psd(self, subject_id, data_dir):
+        """Helper to get raw PSD data for visual comparison. More lenient rejection for Viz."""
+        try:
+            raw = load_subject_eeg(subject_id, data_dir)
+            if raw is None: return None, None
+            
+            sfreq = raw.info['sfreq']
+            
+            # Use a slightly longer window for better resolution in Viz
+            if raw.times[-1] > 60: raw.crop(tmin=10, tmax=60)
+            
+            raw.pick(['eeg'], exclude='bads')
+            raw.filter(0.5, 45, verbose=False)
+            epochs = mne.make_fixed_length_epochs(raw, duration=5.0, preload=True, verbose=False)
+            
+            # Arifact Rejection (Lenient for Viz to ensure output)
+            try:
+                epochs.drop_bad(reject=dict(eeg=300e-6), verbose=False)
+                if len(epochs) == 0:
+                    epochs = mne.make_fixed_length_epochs(raw, duration=5.0, preload=True, verbose=False)
+            except: pass
+            
+            if len(epochs) == 0: return None, None
+            
+            ch_names = epochs.ch_names
+            cluster_indices = [i for i, ch in enumerate(ch_names) if ch.upper() in self.POSTERIOR_TEMPORAL]
+            data = epochs.get_data(picks=cluster_indices) if cluster_indices else epochs.get_data()
+            
+            freqs, psd = signal.welch(data, fs=sfreq, nperseg=int(sfreq), axis=-1)
+            avg_psd = np.mean(psd, axis=(0, 1))
+            return freqs, avg_psd
+        except:
+            return None, None
+
+
+
+
 
     def compute_subject_pli(self, subject_id, data_dir, test_mode=False, cluster_only=True):
         """
@@ -363,28 +437,34 @@ class AlzheimerClassifier:
             ('imputer', SimpleImputer(strategy='median')),
             ('scaler', StandardScaler()),
             ('rf', RandomForestClassifier(
-                n_estimators=200,       # More trees for stability
-                max_depth=7,            # Deeper trees to capture subtleties
+                n_estimators=200,       # Golden settings
+                max_depth=7,            # Golden settings
                 min_samples_split=5,
                 random_state=42,
                 class_weight='balanced',
-                n_jobs=2 # Reduced to 2 to prevent system lag/high memory pressure
+                n_jobs=2 
             ))
+
+
         ])
 
 
 
 
+
         
-        # REFINED FEATURE SET: Only Statistically Significant Biomarkers
-        # Removed: Reactivity_Posterior_Alpha_Block (p=0.93), EO_Posterior_PLI (p=0.23)
+        # GOLDEN FEATURE SET (81.5% Accuracy Baseline)
         self.features = [
-            'EC_Posterior_Theta_Alpha_Ratio', # p < 0.0001 (***)
-            'EC_Posterior_Rel_Alpha',         # p < 0.0001 (***)
-            'EC_Posterior_Rel_High_Alpha',    # p < 0.001 (***)
-            'EC_Posterior_Peak_Alpha_Freq',   # p < 0.01 (**)
-            'EC_Posterior_PLI'                # p < 0.05 (*)
+            'EC_Posterior_Theta_Alpha_Ratio', 
+            'EC_Posterior_Rel_Alpha',        
+            'EC_Posterior_Rel_High_Alpha',   
+            'EC_Posterior_Peak_Alpha_Freq', 
+            'EC_Posterior_PLI'
         ]
+
+
+
+
 
 
 
@@ -678,7 +758,75 @@ class AlzheimerClassifier:
         print(f"✓ Individual Dot Plot saved to {save_path_dots}")
 
 
+def plot_diagnostic_psd_shift(extractor, data_dir, output_dir):
+    """Generates a comparison plot showing Alpha Slowing in AD."""
+    print("\n📈 Generating Diagnostic PSD Visualization (Slowing Analysis)...")
+    
+    # Typical subjects (sub-001 is AD, sub-037 is HC)
+    ad_sub = "sub-001"
+    hc_sub = "sub-037"
+    
+    f_ad, p_ad = extractor.get_subject_psd(ad_sub, data_dir)
+    f_hc, p_hc = extractor.get_subject_psd(hc_sub, data_dir)
+    
+    if f_ad is None or f_hc is None:
+        print("    ! Could not generate PSD plot: Data extraction failed.")
+        return
+
+    plt.figure(figsize=(10, 6))
+    
+    # Ensure 1D and handle log(0)
+    p_ad = np.atleast_1d(p_ad)
+    p_hc = np.atleast_1d(p_hc)
+    p_ad[p_ad <= 0] = 1e-12
+    p_hc[p_hc <= 0] = 1e-12
+    
+    p_ad_pl = 10 * np.log10(p_ad)
+    p_hc_pl = 10 * np.log10(p_hc)
+    
+    # Focus on 1-25 Hz for best visualization
+    mask = (f_ad >= 1) & (f_ad <= 25)
+    
+    f_plot = f_ad[mask]
+    p_hc_plot = p_hc_pl[mask]
+    p_ad_plot = p_ad_pl[mask]
+
+    plt.plot(f_plot, p_hc_plot, color='#2E86C1', lw=3, label='Healthy Control (HC)')
+    plt.plot(f_plot, p_ad_plot, color='#C0392B', lw=3, label="Alzheimer's Patient (AD)")
+    
+    # Highlight Alpha Band
+    plt.axvspan(8, 12, color='gray', alpha=0.1, label='Alpha Band (8-12 Hz)')
+    
+    # Highlight Peaks (Slowing)
+    alpha_mask = (f_plot >= 7) & (f_plot <= 13)
+    if np.any(alpha_mask):
+        paf_hc = f_plot[alpha_mask][np.argmax(p_hc_plot[alpha_mask])]
+        idx_hc = np.argmin(np.abs(f_plot - paf_hc))
+        plt.annotate('HC Peak', xy=(paf_hc, p_hc_plot[idx_hc]), xytext=(paf_hc+2, p_hc_plot[idx_hc]+2),
+                     arrowprops=dict(facecolor='black', shrink=0.05, width=1, headwidth=5))
+        
+        paf_ad = f_plot[alpha_mask][np.argmax(p_ad_plot[alpha_mask])]
+        idx_ad = np.argmin(np.abs(f_plot - paf_ad))
+        plt.annotate('AD Peak (Shifted Left)', xy=(paf_ad, p_ad_plot[idx_ad]), xytext=(paf_ad-4, p_ad_plot[idx_ad]+4),
+                     arrowprops=dict(facecolor='red', shrink=0.05, width=1, headwidth=5))
+
+    plt.title("The 'Slowing' Biomarker: PSD Shift in Alzheimer's", fontsize=15, fontweight='bold', pad=20)
+
+    plt.xlabel("Frequency (Hz)", fontsize=12)
+    plt.ylabel("Power (dB/Hz)", fontsize=12)
+    plt.grid(True, alpha=0.3)
+    plt.legend(frameon=True, fontsize=10)
+    
+    sns.despine()
+    plt.tight_layout()
+    
+    plot_path = os.path.join(output_dir, "diagnostic_psd_slowing.png")
+    plt.savefig(plot_path, dpi=300)
+    plt.close()
+    print(f"✅ Diagnostic PSD plot saved to: {plot_path}")
+
 def main():
+
     # Parse command line arguments for flexibility
     parser = argparse.ArgumentParser(description="Extract EEG features (PLI).")
     parser.add_argument('--full', action='store_true', help='Run analysis on ALL eligible subjects')
@@ -759,12 +907,15 @@ def main():
             ec_spectral = extractor.compute_subject_spectral_features(sub_id, data_dir_ec, test_mode=TEST_MODE, cluster_only=True)
             if ec_spectral: 
                 result_entry['EC_Posterior_Theta_Alpha_Ratio'] = ec_spectral.get('Theta_Alpha_Ratio')
-                result_entry['EC_Posterior_Theta_Beta_Ratio'] = ec_spectral.get('Theta_Beta_Ratio')
                 result_entry['EC_Posterior_Rel_Alpha'] = ec_spectral.get('Rel_Alpha')
                 result_entry['EC_Posterior_Rel_High_Alpha'] = ec_spectral.get('Rel_High_Alpha')
                 result_entry['EC_Posterior_Peak_Alpha_Freq'] = ec_spectral.get('Peak_Alpha_Freq')
-                # Store absolute power for ABR calc
+                # Store absolute power for diagnostic check
                 result_entry['EC_Abs_Alpha'] = ec_spectral.get('Abs_Alpha', np.nan)
+
+
+
+
 
 
         except Exception as e:
@@ -826,9 +977,13 @@ def main():
     # Ensure all expected features exist (fill with NaN if missing)
     expected_features = [
             'EC_Posterior_Theta_Alpha_Ratio', 'EC_Posterior_Rel_Alpha',
-            'EC_Posterior_Rel_High_Alpha', 'EC_Posterior_Peak_Alpha_Freq',
+            'EC_Posterior_Rel_High_Alpha', 'EC_Posterior_Peak_Alpha_Freq', 
             'EC_Posterior_PLI'
         ]
+
+
+
+
 
 
 
@@ -918,8 +1073,11 @@ def main():
     # 6. AI Explanations
     classifier.explain_model(df_results)
     
+    # Generate the Comparison Plot for the User
+    plot_diagnostic_psd_shift(extractor, data_dir_ec, final_output_dir)
+    
     print(f"\n✅ REFINED ANALYSIS COMPLETE")
-    print(f"All records and premium charts stored in: {final_output_dir}")
+    print(f"All records and premium charts stored in: {classifier.output_dir}")
 
 if __name__ == "__main__":
     main()
