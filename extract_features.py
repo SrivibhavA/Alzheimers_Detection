@@ -24,6 +24,9 @@ import networkx as nx
 
 # Suppress MNE warnings about boundary events (preprocessed data discontinuities)
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="mne")
+# Suppress Sklearn name mismatch warnings (common in SHAP/Pipeline interactions)
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+
 
 # ==========================================
 # CONFIGURATION
@@ -296,36 +299,37 @@ class FeaturesExtracter:
 
     @staticmethod
     def _sample_entropy(x, m=2, r=0.2):
-        """Calculate Sample Entropy (SampEn) - robust complexity measure."""
+        """Optimized Sample Entropy using vectorization and downsampling."""
+        # Standardize: Downsample to ~100Hz if signal is large (e.g. 500Hz -> 100Hz)
+        # This keeps the window size manageable (3000 points) while preserving EEG complexity
+        if len(x) > 5000:
+            x = x[::5] 
+            
         N = len(x)
-        # Fix: Use original standard deviation for adaptive thresholding
-        r_threshold = r * np.std(x)
-        
         # Normalize for pattern matching stability
-        x_norm = (x - np.mean(x)) / (np.std(x) + 1e-12)
+        x = (x - np.mean(x)) / (np.std(x) + 1e-12)
         
-        def _maxdist(x_i, x_j, m):
-            """Maximum distance between template vectors."""
-            return max([abs(x_i[k] - x_j[k]) for k in range(m)])
-        
-        def _phi(m):
-            """Count template matches."""
-            patterns = np.array([x_norm[i:i+m] for i in range(N - m)])
+        def _get_matches(m_val):
+            # Create template matrix: (N-m, m)
+            patterns = np.zeros((N - m_val, m_val))
+            for k in range(m_val):
+                patterns[:, k] = x[k : N - m_val + k]
+            
             count = 0
-            for i in range(len(patterns)):
-                for j in range(i + 1, len(patterns)):
-                    # Note: Since x_norm has std=1, we use 'r' directly
-                    if _maxdist(patterns[i], patterns[j], m) < r:
-                        count += 1
-            return count / ((N - m) * (N - m - 1) / 2)
+            # Vectorized comparison for each template against all subsequent templates
+            for i in range(len(patterns) - 1):
+                # Chebyshev distance: max absolute difference
+                dist = np.max(np.abs(patterns[i+1:] - patterns[i]), axis=1)
+                count += np.sum(dist < r)
+            return count
+
+        # A: matches of length m+1, B: matches of length m
+        A = _get_matches(m + 1)
+        B = _get_matches(m)
         
-        try:
-            phi_m = _phi(m)
-            phi_m1 = _phi(m + 1)
-            if phi_m == 0 or phi_m1 == 0: return 0
-            return -np.log(phi_m1 / phi_m)
-        except:
-            return 0
+        if A == 0 or B == 0: return 0
+        return -np.log(A / B)
+
     
     def compute_peak_alpha_frequency(self, subject_id, data_dir, test_mode=False):
         """Extract Peak Alpha Frequency (PAF) - Slowing biomarker."""
@@ -569,20 +573,36 @@ class AlzheimerClassifier:
         explainer = shap.KernelExplainer(lr_model.predict_proba, background)
         shap_values_raw = explainer.shap_values(X_scaled)
         
-        # For Logistic Regression binary classification, SHAP returns list [prob_0, prob_1]
         if isinstance(shap_values_raw, list) and len(shap_values_raw) == 2:
+
+            # List format (samples, features) per class
+            base_value = explainer.expected_value[1]
             shap_values_raw = np.array(shap_values_raw[1])
+        elif isinstance(shap_values_raw, np.ndarray) and len(shap_values_raw.shape) == 3:
+            # 3D array format (samples, features, classes)
+            base_value = explainer.expected_value[1] if len(explainer.expected_value) > 1 else explainer.expected_value
+            shap_values_raw = shap_values_raw[:, :, 1]
         else:
+            base_value = explainer.expected_value
             shap_values_raw = np.array(shap_values_raw)
         
-            
+        # Ensure base_value is a single scalar for np.repeat
+        if hasattr(base_value, "__len__") and len(base_value) > 0:
+            if isinstance(base_value, np.ndarray) and len(base_value.shape) > 0:
+                base_value = base_value[0]
+            elif isinstance(base_value, list):
+                base_value = base_value[0]
+
         # PREMIUM VISUAL FIX: Wrap in a modern SHAP Explanation object
         exp = shap.Explanation(
             values=shap_values_raw,
-            base_values=np.repeat(explainer.expected_value, len(X)),
+            base_values=np.repeat(base_value, len(X)),
             data=X.values, 
             feature_names=self.features
         )
+
+
+
 
         # 1. Premium Bar Chart (shows average impact values)
         plt.figure(figsize=(10, 6))
@@ -635,7 +655,7 @@ def main():
 
     # Path to the datasets
     data_dir_ec = "/home/vijay/Documents/code/Alzheimers/script_downloaded_open_neuro/eeg_alzheimer_data/raw/ds004504"
-    data_dir_eo = "/home/vijay/Documents/code/Alzheimers/script_downloaded_open_neuro/eeg_alzheimer_data/eeg_alzheimer_data_eyes_open/raw/ds006036"
+    data_dir_eo = "/home/vijay/Documents/code/Alzheimers/script_downloaded_open_neuro/eeg_alzheimer_data_eyes_open/raw/ds006036"
 
     print(f"\n{'='*50}")
     print(f"Starting Multi-Condition Extraction Analysis (EC + EO)")
@@ -782,7 +802,8 @@ def main():
             if feature in df_results.columns:
                 plt.figure(figsize=(6, 6))
                 sns.boxplot(x='Group', y=feature, data=df_results, palette="Set2", hue='Group', legend=False)
-                sns.stripplot(x='Group', y=feature, data=df_results, color='black', alpha=0.5, jitter=True, hue='Group', legend=False)
+                sns.stripplot(x='Group', y=feature, data=df_results, color='black', alpha=0.5, jitter=True)
+
                 plt.title(title, fontsize=14)
                 plt.savefig(os.path.join(final_output_dir, f"plot_{feature}.png"))
                 plt.close()
