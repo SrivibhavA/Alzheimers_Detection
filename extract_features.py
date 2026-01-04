@@ -448,10 +448,6 @@ class AlzheimerClassifier:
 
         ])
 
-
-
-
-
         
         # GOLDEN FEATURE SET (81.5% Accuracy Baseline)
         self.features = [
@@ -459,18 +455,9 @@ class AlzheimerClassifier:
             'EC_Posterior_Rel_Alpha',        
             'EC_Posterior_Rel_High_Alpha',   
             'EC_Posterior_Peak_Alpha_Freq', 
-            'EC_Posterior_PLI'
+            'EC_Posterior_PLI',
+            'Reactivity_Posterior_Alpha_Block'
         ]
-
-
-
-
-
-
-
-
-
-        
         
     def prepare_data(self, df):
         """Prepare features (X) and target (y)"""
@@ -844,8 +831,8 @@ def main():
         TEST_MODE = DEFAULT_TEST_MODE
 
     # Path to the datasets
-    data_dir_ec = "/home/vijay/Documents/code/Alzheimers/script_downloaded_open_neuro/eeg_alzheimer_data/raw/ds004504"
-    data_dir_eo = "/home/vijay/Documents/code/Alzheimers/script_downloaded_open_neuro/eeg_alzheimer_data_eyes_open/raw/ds006036"
+    data_dir_ec = "C:\\Users\\amiri\\OneDrive\Documents\SrivibhavBCIProject\Alzheimers_Detection\\alz_data\script_downloaded_open_neuro\eeg_alzheimer_data\\raw\ds004504"
+    data_dir_eo = "C:\\Users\\amiri\\OneDrive\Documents\SrivibhavBCIProject\Alzheimers_Detection\\alz_data\script_downloaded_open_neuro\eeg_alzheimer_data_eyes_open\\raw\ds006036"
 
     print(f"\n{'='*50}")
     print(f"Starting Multi-Condition Extraction Analysis (EC + EO)")
@@ -913,11 +900,6 @@ def main():
                 # Store absolute power for diagnostic check
                 result_entry['EC_Abs_Alpha'] = ec_spectral.get('Abs_Alpha', np.nan)
 
-
-
-
-
-
         except Exception as e:
             print(f"    ! Error extracting EC data for {sub_id}: {e}")
         
@@ -938,11 +920,12 @@ def main():
 
         # 3. Calculate Regional "Reactivity" (ABR = EC / EO)
         # Healthy brains block alpha in posterior regions when eyes open.
+        #NORMALIZED VERSION
         if result_entry.get('EC_Abs_Alpha') and result_entry.get('EO_Abs_Alpha'):
             ec_alpha = result_entry['EC_Abs_Alpha']
             eo_alpha = result_entry['EO_Abs_Alpha']
             if eo_alpha > 0:
-                result_entry['Reactivity_Posterior_Alpha_Block'] = ec_alpha / eo_alpha
+                result_entry['Reactivity_Posterior_Alpha_Block'] = (ec_alpha - eo_alpha)
 
 
 
@@ -978,21 +961,8 @@ def main():
     expected_features = [
             'EC_Posterior_Theta_Alpha_Ratio', 'EC_Posterior_Rel_Alpha',
             'EC_Posterior_Rel_High_Alpha', 'EC_Posterior_Peak_Alpha_Freq', 
-            'EC_Posterior_PLI'
+            'EC_Posterior_PLI', 'Reactivity_Posterior_Alpha_Block'
         ]
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     for col in expected_features:
         if col not in df_results.columns:
@@ -1042,17 +1012,9 @@ def main():
             'EC_Posterior_Rel_Alpha': 'Posterior Alpha (EC)',
             'EC_Posterior_Rel_High_Alpha': 'High Alpha (10-12 Hz)',
             'EC_Posterior_Peak_Alpha_Freq': 'Peak Alpha Frequency (PAF)',
-            'EC_Posterior_PLI': 'Posterior Connectivity (EC)'
+            'EC_Posterior_PLI': 'Posterior Connectivity (EC)',
+            'Reactivity_Posterior_Alpha_Block': 'Reactivity Posterior Alpha Blocking'
         }
-
-
-
-
-
-
-
-
-
 
 
 
