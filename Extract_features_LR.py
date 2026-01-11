@@ -929,25 +929,39 @@ class AlzheimerClassifier:
                 plt.close(fig)
                 print(f"✓ RF Feature Importance Chart saved to {save_path_bar_rf}")
                 # ========================================
-                # RF VIOLIN PLOT - SAME AS LR
+                # RF VIOLIN PLOT - FIXED FOR CLASS 1
                 # ========================================
                 print("Creating RF Violin Plot...")
 
-                fig = plt.figure(figsize=(10, 6))
+                # Extract SHAP values for the "Alzheimer's" class (Index 1)
+                # This handles both list outputs and numpy array outputs from TreeExplainer
+                if isinstance(shap_values_raw_rf, list):
+                    shap_to_plot = shap_values_raw_rf[1]
+                else:
+                    # If it's a 3D array [samples, features, classes], take class 1
+                    shap_to_plot = shap_values_raw_rf[:, :, 1] if len(
+                        shap_values_raw_rf.shape) == 3 else shap_values_raw_rf
+
+                fig = plt.figure(figsize=(10, 8))
+
+                # summary_plot with plot_type="violin"
                 shap.summary_plot(
-                    shap_values_raw_rf,
+                    shap_to_plot,
                     X,
                     plot_type="violin",
                     max_display=10,
-                    show=False,
-                    feature_names=feature_names_list
+                    show=False
                 )
-                plt.title("RF: Impact Distribution (Spread & Shape)", fontsize=14, pad=15)
-                plt.tight_layout()
+
+                # Labeling the sides to make it intuitive
+                plt.title("Random Forest: Feature Impact on Alzheimer's Detection", fontsize=14, pad=20)
+                plt.xlabel("SHAP Value (Left: Toward Healthy | Right: Toward Alzheimer's)", fontsize=11)
 
                 save_path_violin_rf = os.path.join(self.output_dir, "RF_shap_violin.png")
                 plt.savefig(save_path_violin_rf, bbox_inches='tight', dpi=150)
-                plt.close(fig)
+                plt.close()
+
+                print(f"✓ RF Violin Plot saved to {save_path_violin_rf}")
                 print(f"✓ RF Violin Plot saved to {save_path_violin_rf}")
 
                 # ========================================
