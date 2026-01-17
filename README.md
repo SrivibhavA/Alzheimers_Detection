@@ -8,4 +8,3 @@ The code generates box plots, SHAP bar charts, violin charts, and dot plots for 
 
 You can have the code do a tiny test (10 patients), a half-test (20 patients), and all the patients (65). You can use a flag to control which mode you want (--tiny, --test, and --full respectively).
 
-The file with the better accuracy if Extract_features_LR.py. The other ones are reference files made in the past.
