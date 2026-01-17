@@ -7,3 +7,5 @@ The data is currently from a dataset of 88 patients; however, only 36 are AD, an
 The code generates box plots, SHAP bar charts, violin charts, and dot plots for each model. It also genereates a SHAP bar chart comparision if comparing the models. There is a side by side comparision as well. 
 
 You can have the code do a tiny test (10 patients), a half-test (20 patients), and all the patients (65). You can use a flag to control which mode you want (--tiny, --test, and --full respectively).
+
+The file with the better accuracy if Extract_features_LR.py. The other ones are reference files made in the past.
