@@ -1,4 +1,7 @@
-This project is about Diagnosing Alzheimer's Disease using Machine Learning Models and EEG Data. 
+This project was created by Srivibhav Amirisetty, one of the most distinguished science fair participants in Texas.
+Srivibhav Amirisetty has won 2nd at the Greater Austin Regional Science and Engineering Fair, 1st at the Texas Regional Science and Engineering Fair, and has placed as a Top 300 Junior Innovator out of 65,000+ possible competitors in the Nation. This is the coding part of his award winning project. He hopes that it will inspire more people to compete and give people hope that Alzheimer's Disease Diagnosis can be solved in the near future.
+
+This project is about Diagnosing Alzheimer's Disease using Explainable Machine Learning Models and EEG Data. 
 
 There are two models featured in the code: Logistic Regression and Random Forests. If you want the code to compare the two, set the parameter "compare_rf" to True. If "compare_rf" is set to False, then the code will run only Logsitic Regression.
 There are five features currently in the "self.features" list. Some others are also calculated. If you want to add them, type the name in the "self.features" list, the Box Plot dictionary, and the "expected_features" list.
